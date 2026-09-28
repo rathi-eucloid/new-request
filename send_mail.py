@@ -9,12 +9,13 @@
 # formatting reference in image.png:
 #   * one shared "Timestamp EST" column on the left
 #   * each product is a group of columns with a merged product title on top
-#   * per product we ONLY show:  SKU | Samsung Price | Amazon Price | vs Amazon
-#       - Samsung price column first, then Amazon price column
-#       - BestBuy price / BestBuy & Amazon SKU columns are dropped
+#   * per product we ONLY show:
+#       SKU | Samsung Price | Amazon Price | vs Amazon | BestBuy Price | vs BestBuy
+#       - Samsung price column first, then Amazon, then BestBuy
+#       - BestBuy & Amazon SKU columns are dropped
 #       - only ONE sku column (Samsung's), header simply reads "SKU"
-#       - "vs Amazon" is shown as a percentage (e.g. +3.5% / -13.5%),
-#         NOT the raw -1.00..1.00 delta
+#       - "vs Amazon" / "vs BestBuy" are shown as percentages (e.g. +3.5% /
+#         -13.5%), NOT the raw -1.00..1.00 delta
 #   * a narrow blank "column breaker" separates one product from the next
 #   * only rows from the past 15 days (relative to send time) are included
 #
@@ -26,6 +27,10 @@
 #   MAIL_SUBJECT    subject line   (optional, sensible default)
 #   SMTP_HOST       defaults to smtp.office365.com   (Microsoft default)
 #   SMTP_PORT       defaults to 587 (STARTTLS)
+#   REPORT_XLSX     source workbook (defaults to outputs/results.xlsx)
+#
+# Preview mode (no email sent): `python send_mail.py --preview [out.html]`
+# writes the rendered mail to an .html file and a matching .eml file.
 # =========================================================================
 import os
 import ssl
@@ -38,7 +43,7 @@ from email.utils import formatdate, make_msgid
 from openpyxl import load_workbook
 
 # ---- must match script_3.py's WIP layout ------------------------------------
-EXCEL_PATH      = os.path.join("outputs", "results.xlsx")
+EXCEL_PATH      = os.environ.get("REPORT_XLSX", os.path.join("outputs", "results.xlsx"))
 FIRST_GROUP_COL = 3          # column C
 GROUP_STRIDE    = 9
 TIMESTAMP_COL   = 2          # column B
@@ -52,6 +57,7 @@ WINDOW_DAYS     = 4
 # per-group column offsets (0-indexed from the group's first column)
 OFF_AMAZON_PRICE  = 0
 OFF_SAMSUNG_PRICE = 1
+OFF_BESTBUY_PRICE = 2
 OFF_SKU_SAMSUNG   = 4
 
 # ---- Microsoft SMTP defaults ------------------------------------------------
@@ -97,11 +103,12 @@ def _fmt_sku(value):
     return s.upper()
 
 
-def _fmt_vs(amazon_val, samsung_val):
-    """vs Amazon = Amazon / Samsung - 1, rendered as a signed percentage.
-    Returns (text, colour). Sign and colour are swapped: Amazon pricier than
-    Samsung -> shown as negative -> green; Amazon cheaper -> positive -> red."""
-    a = _as_float(amazon_val)
+def _fmt_vs(retailer_val, samsung_val):
+    """vs <retailer> = Retailer / Samsung - 1, rendered as a signed percentage.
+    Used for both "vs Amazon" and "vs BestBuy".
+    Returns (text, colour). Sign and colour are swapped: retailer pricier than
+    Samsung -> shown as negative -> green; retailer cheaper -> positive -> red."""
+    a = _as_float(retailer_val)
     s = _as_float(samsung_val)
     if a is None or s is None or s == 0:
         return "&mdash;", "#9e9e9e"
@@ -109,9 +116,9 @@ def _fmt_vs(amazon_val, samsung_val):
     if round(pct, 1) == 0:        # rounds to zero -> show a clean "0%"
         return "0%", "#000000"
     if pct > 0:
-        colour = "#1b7a2f"        # Amazon pricier than Samsung (green)
+        colour = "#1b7a2f"        # retailer pricier than Samsung (green)
     else:
-        colour = "#c62828"        # Amazon cheaper than Samsung (red)
+        colour = "#c62828"        # retailer cheaper than Samsung (red)
     return f"{-pct:+.1f}%", colour
 
 
@@ -182,14 +189,19 @@ def load_report_model(path=EXCEL_PATH):
             gc = g["col"]
             amazon  = ws.cell(row=r, column=gc + OFF_AMAZON_PRICE).value
             samsung = ws.cell(row=r, column=gc + OFF_SAMSUNG_PRICE).value
+            bestbuy = ws.cell(row=r, column=gc + OFF_BESTBUY_PRICE).value
             sku     = ws.cell(row=r, column=gc + OFF_SKU_SAMSUNG).value
             vs_txt, vs_colour = _fmt_vs(amazon, samsung)
+            vs_bb_txt, vs_bb_colour = _fmt_vs(bestbuy, samsung)
             cells.append({
                 "sku":     _fmt_sku(sku),
                 "samsung": _fmt_price(samsung),
                 "amazon":  _fmt_price(amazon),
                 "vs":      vs_txt,
                 "vs_colour": vs_colour,
+                "bestbuy": _fmt_price(bestbuy),
+                "vs_bb":   vs_bb_txt,
+                "vs_bb_colour": vs_bb_colour,
             })
         rows.append({"timestamp": str(ts_val).strip(), "cells": cells, "_ts": ts})
 
@@ -236,9 +248,9 @@ def build_table_html(groups, rows):
             f'margin:0 0 4px 0;">'
         )
 
-        # ---- product title (spans all 5 columns) ----------------------------
+        # ---- product title (spans all 7 columns) ----------------------------
         parts.append("<tr>")
-        parts.append(_th(g["label"], bg=TITLE_BG, colspan=5, size="14px",
+        parts.append(_th(g["label"], bg=TITLE_BG, colspan=7, size="14px",
                          align="left"))
         parts.append("</tr>")
 
@@ -249,6 +261,8 @@ def build_table_html(groups, rows):
         parts.append(_th("Samsung Price", bg=SUBHEAD_BG))
         parts.append(_th("Amazon Price", bg=SUBHEAD_BG))
         parts.append(_th("vs Amazon", bg=SUBHEAD_BG))
+        parts.append(_th("BestBuy Price", bg=SUBHEAD_BG))
+        parts.append(_th("vs BestBuy", bg=SUBHEAD_BG))
         parts.append("</tr>")
 
         # ---- data rows (one per timestamp), grouped by date -----------------
@@ -262,7 +276,7 @@ def build_table_html(groups, rows):
             cur_date = row["_ts"].date()
             if prev_date is not None and cur_date != prev_date:
                 parts.append(
-                    f'<tr><td colspan="5" style="padding:0;'
+                    f'<tr><td colspan="7" style="padding:0;'
                     f'border:none;border-top:3px solid {SEP};'
                     f'line-height:0;font-size:0;">&nbsp;</td></tr>'
                 )
@@ -288,6 +302,14 @@ def build_table_html(groups, rows):
             parts.append(
                 f'<td style="{TD_BASE}background:{row_bg};text-align:right;'
                 f'font-weight:700;color:{cell["vs_colour"]};">{cell["vs"]}</td>'
+            )
+            parts.append(
+                f'<td style="{TD_BASE}background:{row_bg};text-align:right;">'
+                f'{cell["bestbuy"]}</td>'
+            )
+            parts.append(
+                f'<td style="{TD_BASE}background:{row_bg};text-align:right;'
+                f'font-weight:700;color:{cell["vs_bb_colour"]};">{cell["vs_bb"]}</td>'
             )
             parts.append("</tr>")
 
@@ -321,7 +343,7 @@ def build_email_html(groups, rows, cutoff):
                font-family:Segoe UI,Arial,sans-serif;color:#222;">
     <p style="font-size:15px;margin:0 0 6px 0;">Hello,</p>
     <p style="font-size:15px;margin:0 0 16px 0;">
-      Please find below the latest Samsung vs Amazon price comparison report.
+      Please find below the latest Samsung vs Amazon vs BestBuy price comparison report.
     </p>
     <p style="font-size:12px;color:#666;margin:0 0 18px 0;">{note}</p>
     <div style="overflow-x:auto;">
@@ -345,7 +367,7 @@ def send_email(html_body):
     sender = os.environ.get("MAIL_FROM", username)
     subject = os.environ.get(
         "MAIL_SUBJECT",
-        f"Samsung vs Amazon Price Report — {datetime.now():%d %b %Y}",
+        f"Samsung vs Amazon vs BestBuy Price Report — {datetime.now():%d %b %Y}",
     )
 
     missing = [name for name, val in
@@ -365,7 +387,7 @@ def send_email(html_body):
     msg["Message-ID"] = make_msgid()
 
     msg.set_content(
-        "Hello,\n\nPlease find below the Samsung vs Amazon price comparison "
+        "Hello,\n\nPlease find below the Samsung vs Amazon vs BestBuy price comparison "
         "report. This message is best viewed in an HTML-capable email client.\n\n"
         "Best regards,\nPrice Tracking Automation"
     )
@@ -382,12 +404,40 @@ def send_email(html_body):
     print(f"✅ Report emailed to {len(recipients)} recipient(s) via {SMTP_HOST}:{SMTP_PORT}")
 
 
+def save_preview(html_body, out_path):
+    """Write the rendered mail to disk instead of sending it: an .html file
+    (open in a browser) plus a matching .eml (open in Outlook / Mail)."""
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(html_body)
+
+    msg = EmailMessage()
+    msg["Subject"] = os.environ.get(
+        "MAIL_SUBJECT",
+        f"Samsung vs Amazon vs BestBuy Price Report — {datetime.now():%d %b %Y}",
+    )
+    msg["From"] = os.environ.get("MAIL_FROM", os.environ.get("MAIL_USERNAME", "sender@example.com"))
+    msg["To"] = os.environ.get("MAIL_TO", "recipient@example.com")
+    msg["Date"] = formatdate(localtime=True)
+    msg.set_content("This message is best viewed in an HTML-capable email client.")
+    msg.add_alternative(html_body, subtype="html")
+    eml_path = os.path.splitext(out_path)[0] + ".eml"
+    with open(eml_path, "wb") as fh:
+        fh.write(bytes(msg))
+
+    print(f"Preview saved (no email sent): {out_path} and {eml_path}")
+
+
 def main():
     groups, rows, cutoff = load_report_model()
     print(f"Loaded {len(groups)} product group(s); "
           f"{len(rows)} row(s) within the past {WINDOW_DAYS} days.")
     email_html = build_email_html(groups, rows, cutoff)
-    send_email(email_html)
+    if "--preview" in sys.argv:
+        idx = sys.argv.index("--preview")
+        out = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else "mail_preview.html"
+        save_preview(email_html, out)
+    else:
+        send_email(email_html)
 
 
 if __name__ == "__main__":

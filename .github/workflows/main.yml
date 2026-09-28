@@ -46,34 +46,30 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright beautifulsoup4 openpyxl lxml playwright-stealth
+          # Amazon + BestBuy now come from Apify (plain HTTPS, no extra package);
+          # only Samsung still uses Playwright.
+          pip install playwright openpyxl
 
-      - name: Install Playwright browsers (with deps)
+      - name: Install Playwright Chromium (with deps)
         run: |
-          python -m playwright install --with-deps
-
-      - name: Install Xvfb (virtual display for headful BestBuy)
-        run: |
-          # BestBuy tears down the HTTP/2 connection for headless Chromium, so the
-          # BestBuy scraper runs headful (headless=False). On this display-less
-          # runner we give Chromium a virtual X display via Xvfb.
-          sudo apt-get update
-          sudo apt-get install -y xvfb
+          # Samsung is the only browser scraper left and it uses headless Chromium.
+          python -m playwright install --with-deps chromium
 
       - name: Ensure output directory exists
         run: |
           mkdir -p outputs
 
-      - name: Run scraper (headful under Xvfb) and capture logs
+      - name: Run scraper and capture logs
         id: run-scraper
+        env:
+          # Apify API tokens for the Amazon + BestBuy actors, comma separated.
+          # Used in order: when one account's credit runs out the next is used.
+          # Set it in Settings -> Secrets and variables -> Actions.
+          APIFY_API_TOKENS: ${{ secrets.APIFY_API_TOKENS }}
         run: |
           set -o pipefail
 
-          # xvfb-run provides a virtual display so the headful BestBuy browser
-          # works on this headless runner. Amazon/Samsung still launch headless
-          # from inside the script; running them under Xvfb too is harmless.
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
-            python script.py 2>&1 | tee run.log
+          python script.py 2>&1 | tee run.log
           rc=${PIPESTATUS[0]}
           echo "$rc" > run_exit_code.txt
 

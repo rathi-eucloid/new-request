@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-script for scraping product pages from Amazon, BestBuy, and Samsung using Playwright.
-- Saves each page's HTML to a unique file in outputs/ directory.
-- Parses each HTML to extract product price and model number (or SKU for Samsung).
+Price scraper for Amazon, BestBuy and Samsung.
+- Samsung : scraped with Playwright; each page's HTML is saved to outputs/ and
+            parsed for the price.
+- Amazon  : fetched through an Apify actor (see the APIFY section below).
+- BestBuy : fetched through an Apify actor (see the APIFY section below).
+  Apify API tokens are read from the APIFY_API_TOKENS environment variable.
 
-This version additionally saves the run's result as a single row in an Excel file:
-- Columns = keys (flattened per-site/per-index keys like "amazon_1_url")
-- Row = values for this run
-- On next run the script appends a new row (does not overwrite previous data).
-
+Each run appends one row to outputs/results.xlsx (layout: see
+save_results_wip_format); earlier rows are kept.
 """
 from zoneinfo import ZoneInfo
 import datetime
@@ -17,40 +17,13 @@ import json
 import os
 import random
 import re
-import socket
-import shutil
-import tempfile
-import subprocess
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 from urllib.parse import quote_plus
 from playwright.async_api import async_playwright, TimeoutError
-from bs4 import BeautifulSoup
-
-# Optional anti-bot stealth (used for BestBuy only). The package API differs
-# across versions, so we detect what's available and expose a single async
-# helper _apply_stealth(page). If the package isn't installed, it's a no-op so
-# the rest of the script still runs.
-#   - playwright-stealth 1.x:  from playwright_stealth import stealth_async
-#   - playwright-stealth 2.x:  from playwright_stealth import Stealth  (Stealth().apply_stealth_async)
-try:
-    from playwright_stealth import stealth_async as _stealth_async  # 1.x
-
-    async def _apply_stealth(page):
-        await _stealth_async(page)
-    _STEALTH_AVAILABLE = True
-except Exception:
-    try:
-        from playwright_stealth import Stealth as _Stealth  # 2.x
-        _stealth_instance = _Stealth()
-
-        async def _apply_stealth(page):
-            await _stealth_instance.apply_stealth_async(page)
-        _STEALTH_AVAILABLE = True
-    except Exception:
-        async def _apply_stealth(page):
-            return None  # package not installed -> no-op
-        _STEALTH_AVAILABLE = False
 from openpyxl.utils import column_index_from_string, get_column_letter
 # new imports for Excel writing
 from openpyxl import Workbook, load_workbook
@@ -66,36 +39,22 @@ from openpyxl import Workbook, load_workbook
 # 2. Duplicate-element fix: the old hardcoded selectors matched many elements on
 #    the page (related items, sponsored, carousels), causing wrong reads. We now
 #    scope price extraction to the MAIN price container only.
-# 3. Updated selectors for current UI: Amazon price -> corePriceDisplay /
-#    priceToPay; BestBuy & Samsung price -> JSON-LD offer (Samsung keyed by SKU).
-# 4. BestBuy fix: headless Chromium fails with ERR_HTTP2_PROTOCOL_ERROR (BestBuy
-#    tears down the HTTP/2 connection for headless browsers), so nothing is saved.
-#    We launch BestBuy's Chromium HEADFUL (headless=False) on default HTTP/2 (NOT
-#    --disable-http2, which made the CDN return empty shells) and with no custom
-#    user-agent. On a display-less server (EC2 / GitHub Actions) run it under Xvfb.
+# 3. Updated selectors for current UI: Samsung price -> JSON-LD offer keyed by SKU.
+# 4. Amazon and BestBuy are no longer scraped with a browser; they come from
+#    Apify actors (see the APIFY section). Redirect detection for them compares
+#    the requested ASIN / BestBuy product code with what the actor returned.
 # 5. results.xlsx now uses the same layout as "Price Comparisons_v3_WIP":
-#    51 product groups x 9 columns starting at column C, timestamp in column B.
-# Everything else (URLs, delays, user agents, cookies logic) is unchanged.
+#    product groups x 9 columns starting at column C, timestamp in column B.
 # =========================================================================
 NOT_AVAILABLE = "not available"
 
-# Retry policy for transient failures (network errors, timeouts, or a page that
-# navigated OK but didn't render its price in time). 1 initial try + 2 retries.
-# Genuine outcomes (a redirect to another product, or a page that explicitly says
-# it's unavailable) are treated as FINAL and are NOT retried.
+# Samsung retry policy for transient failures (network errors, timeouts, or a
+# page that navigated OK but didn't render its price in time). 1 initial try +
+# 2 retries. Genuine outcomes (a redirect to another product, or a page that
+# explicitly says it's unavailable) are treated as FINAL and are NOT retried.
+# (Amazon/BestBuy retries are separate: see APIFY_ROUNDS.)
 MAX_ATTEMPTS = 3
 RETRY_BACKOFF_SEC = 5
-
-# ---- Amazon-only pacing ----
-# RETRY_BACKOFF_SEC above is SHARED by the BestBuy and Samsung scrapers, so
-# these Amazon-specific values are kept separate: changing the shared constant
-# would also slow those two sites down.
-#   AMAZON_RETRY_BACKOFF_SEC   - wait before re-attempting the SAME url
-#   AMAZON_BETWEEN_URL_GAP_SEC - wait after finishing one url, before the next
-# Amazon rate-limits rapid sequential product-page hits and answers with a
-# CAPTCHA page instead of the product, so both gaps are deliberately generous.
-AMAZON_RETRY_BACKOFF_SEC = 20
-AMAZON_BETWEEN_URL_GAP_SEC = 20
 
 # Excel layout of Price Comparisons_v3_WIP (per product group of 9 columns):
 #   +0 Amazon price  +1 Samsung price  +2 BestBuy price
@@ -597,592 +556,419 @@ def copy_columns_by_references(
 
 
 # -----------------------
+# APIFY (Amazon + BestBuy)
+# -----------------------
+# Amazon and BestBuy are fetched through Apify actors instead of our own
+# Playwright browser. Each site is ONE actor run that takes every URL at once:
+#   Amazon : delicious_zebu/amazon-product-details-scraper  (APIFY_AMAZON_ACTOR)
+#   BestBuy: benthepythondev/bestbuy-scraper                (APIFY_BESTBUY_ACTOR)
+#
+# Tokens: env var APIFY_API_TOKENS (a GitHub Actions secret), several tokens
+# separated by commas or newlines. They are used strictly in order; a token is
+# dropped and the next one used when its account can't run the actor:
+#   - before first use we read the account's monthly credit (/users/me/limits)
+#     and skip the token if less than APIFY_MIN_REMAINING_USD is left;
+#   - if Apify rejects a call with one of the credit/permission errors below
+#     (HTTP 401/402/403), we switch to the next token and start again;
+#   - if a run ends early (e.g. credit ran out mid-run) its credit is re-checked
+#     and the URLs that got no data are re-run, on the next token if needed.
+#
+# Each per-URL result keeps the same shape the Excel writer expects:
+#   {"url", "file", "price", "model", "status"}
+#   price = price text        -> written as a number
+#   price = NOT_AVAILABLE     -> redirect / unavailable / used-only / no price
+#   price = None              -> no data at all (empty slot / Apify failed) -> blank
+
+APIFY_API_BASE = "https://api.apify.com/v2"
+APIFY_AMAZON_ACTOR = "U3DyJ7kdhQlYyeQKd"    # delicious_zebu/amazon-product-details-scraper
+APIFY_BESTBUY_ACTOR = "pbUZ4z2ORsyKhZshL"   # benthepythondev/bestbuy-scraper
+
+APIFY_RUN_TIMEOUT_SEC = 900     # Apify aborts a run that takes longer than this
+APIFY_POLL_WAIT_SEC = 60        # each status poll blocks up to this long (Apify max 60)
+APIFY_ROUNDS = 3                # 1 run for all URLs + up to 2 re-runs for URLs with no data
+APIFY_MIN_REMAINING_USD = 0.20  # a full Amazon+BestBuy pass costs ~$0.15 on the free plan
+APIFY_HTTP_RETRIES = 3          # per API call, for network errors / HTTP 429 / 5xx
+
+# Apify error "type" values meaning THIS token/account can't run the actor, so
+# the next token should be tried. Credit exhaustion shows up as:
+#   403 platform-feature-disabled          "Monthly usage hard limit exceeded"
+#   402 not-enough-usage-to-run-paid-actor  (not enough credit left to start)
+# Any other 401/402/403 is treated the same way (see ApifyError.token_unusable).
+APIFY_TOKEN_ERROR_TYPES = {
+    "platform-feature-disabled",
+    "not-enough-usage-to-run-paid-actor",
+    "monthly-usage-limit-too-low",
+    "limit-reached",
+    "x402-payment-required",
+    "apify-plan-required-to-use-paid-actor",
+    "user-has-no-subscription",
+    "actor-is-not-rented",
+    "full-permission-actor-not-approved",
+    "full-permission-actor-blocked-for-admin",
+    "elevated-permissions-needed",
+    "insufficient-permissions",
+    "actor-memory-limit-exceeded",
+    "concurrent-runs-limit-exceeded",
+    "invalid-token",
+    "token-not-provided",
+    "user-or-token-not-found",
+    "user-disabled",
+}
+
+_APIFY_TERMINAL = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
+
+
+class ApifyError(Exception):
+    """An error response from the Apify API."""
+
+    def __init__(self, status, err_type, message):
+        super().__init__(f"HTTP {status} {err_type or '?'}: {message}")
+        self.status = status
+        self.type = err_type or ""
+        self.message = message or ""
+
+    @property
+    def token_unusable(self):
+        """True when switching to another token may fix it (credit / permission)."""
+        return self.status in (401, 402, 403) or self.type in APIFY_TOKEN_ERROR_TYPES
+
+
+def _apify_call(method, path, token, body=None, params=None, timeout=90):
+    """One Apify API call. Returns the parsed JSON body.
+
+    Network errors, HTTP 429 and HTTP 5xx are retried (APIFY_HTTP_RETRIES);
+    any other error status raises ApifyError straight away.
+    """
+    url = APIFY_API_BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    last_err = None
+    for attempt in range(1, APIFY_HTTP_RETRIES + 1):
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                err = (json.loads(raw) or {}).get("error") or {}
+            except Exception:
+                err = {}
+            api_err = ApifyError(e.code, err.get("type"), err.get("message") or raw[:300])
+            if e.code != 429 and e.code < 500:
+                raise api_err
+            last_err = api_err
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            last_err = e
+        if attempt < APIFY_HTTP_RETRIES:
+            time.sleep(5 * attempt)
+    raise last_err
+
+
+def _apify_credit_check(token):
+    """Return (usable, note) for a token based on its account's monthly credit.
+
+    Only a definite answer disqualifies a token: an invalid token (401) or an
+    account whose usage hard limit is already hit / nearly hit. If the limits
+    can't be read for any other reason we still try the token.
+    """
+    try:
+        data = (_apify_call("GET", "/users/me/limits", token) or {}).get("data") or {}
+    except ApifyError as e:
+        if e.status == 401 or e.type == "platform-feature-disabled":
+            return False, str(e)
+        return True, f"credit not readable ({e}), trying anyway"
+    except Exception as e:
+        return True, f"credit not readable ({e}), trying anyway"
+    max_usd = (data.get("limits") or {}).get("maxMonthlyUsageUsd")
+    used_usd = (data.get("current") or {}).get("monthlyUsageUsd")
+    if isinstance(max_usd, (int, float)) and isinstance(used_usd, (int, float)) and max_usd > 0:
+        left = max_usd - used_usd
+        if left < APIFY_MIN_REMAINING_USD:
+            return False, f"only ${left:.2f} of ${max_usd:.2f} monthly credit left"
+        return True, f"${left:.2f} of ${max_usd:.2f} monthly credit left"
+    return True, "credit unknown"
+
+
+class ApifyTokenPool:
+    """The Apify tokens for this run, used in order until each is used up."""
+
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.idx = 0            # index of the token currently in use
+        self.checked = set()    # indexes whose credit has been checked
+
+    @classmethod
+    def from_env(cls):
+        raw = os.environ.get("APIFY_API_TOKENS") or os.environ.get("APIFY_API_TOKEN") or ""
+        tokens = [t for t in re.split(r"[\s,;]+", raw) if t]
+        if not tokens:
+            print("⚠️ APIFY_API_TOKENS is not set -> Amazon and BestBuy will be left blank")
+        else:
+            print(f"🔑 {len(tokens)} Apify token(s) loaded")
+        return cls(tokens)
+
+    def label(self):
+        t = self.tokens[self.idx]
+        return f"token #{self.idx + 1} (...{t[-4:]})"
+
+    def current(self):
+        """Token to use now (credit-checked on first use), or None if all are used up."""
+        while self.idx < len(self.tokens):
+            if self.idx not in self.checked:
+                self.checked.add(self.idx)
+                usable, note = _apify_credit_check(self.tokens[self.idx])
+                if not usable:
+                    print(f"⚠️ Apify {self.label()} skipped: {note}")
+                    self.idx += 1
+                    continue
+                print(f"🔑 using Apify {self.label()}: {note}")
+            return self.tokens[self.idx]
+        return None
+
+    def drop_current(self, reason):
+        print(f"⚠️ Apify {self.label()} can't be used ({reason}) -> switching to the next token")
+        self.idx += 1
+
+    def recheck_current(self):
+        """Re-check the current token's credit before its next use."""
+        self.checked.discard(self.idx)
+
+
+def _apify_run_actor(pool, actor_id, actor_input, site):
+    """Run an actor once and return (items, run_status).
+
+    Uses the first usable token, moving to the next one on a credit/permission
+    error. Returns (None, reason) if the run could not be done at all.
+    """
+    while True:
+        token = pool.current()
+        if token is None:
+            return None, "no usable Apify token left"
+        who = pool.label()
+        try:
+            print(f"🚀 [{site}] starting Apify actor {actor_id} with {who} ...")
+            run = _apify_call("POST", f"/acts/{actor_id}/runs", token, body=actor_input,
+                              params={"timeout": APIFY_RUN_TIMEOUT_SEC})["data"]
+            run_id = run["id"]
+            # Apify stops the run itself at APIFY_RUN_TIMEOUT_SEC; the extra
+            # margin only guards against a run stuck in a non-final state.
+            deadline = time.monotonic() + APIFY_RUN_TIMEOUT_SEC + 300
+            while run.get("status") not in _APIFY_TERMINAL and time.monotonic() < deadline:
+                run = _apify_call("GET", f"/actor-runs/{run_id}", token,
+                                  params={"waitForFinish": APIFY_POLL_WAIT_SEC})["data"]
+            status = run.get("status")
+            print(f"[{site}] Apify run {run_id} -> {status} {run.get('statusMessage') or ''}")
+            items = _apify_call("GET", f"/datasets/{run['defaultDatasetId']}/items", token,
+                                params={"clean": "true", "format": "json"})
+            return (items if isinstance(items, list) else []), status
+        except ApifyError as e:
+            if e.token_unusable:
+                pool.drop_current(e)
+                continue
+            print(f"❌ [{site}] Apify call failed: {e}")
+            return None, str(e)
+        except Exception as e:
+            print(f"❌ [{site}] Apify call failed: {e}")
+            return None, str(e)
+
+
+def _apify_collect(pool, site, actor_id, keyed_urls, build_input, item_key, item_done):
+    """Fetch every URL through the actor, re-running only what's still missing.
+
+    keyed_urls: {key: url} for the non-empty slots.
+    Returns {key: item} for the keys the actor returned data for.
+    """
+    found = {}
+    for rnd in range(1, APIFY_ROUNDS + 1):
+        todo = [u for k, u in keyed_urls.items() if k not in found or not item_done(found[k])]
+        if not todo:
+            break
+        print(f"\n[{site}] Apify round {rnd}/{APIFY_ROUNDS}: {len(todo)} URL(s)")
+        items, status = _apify_run_actor(pool, actor_id, build_input(todo), site)
+        if items is None:
+            if pool.current() is None:
+                print(f"❌ [{site}] all Apify tokens used up -> remaining URLs left blank")
+                break
+            continue
+        for it in items:
+            k = item_key(it) if isinstance(it, dict) else None
+            if k in keyed_urls and (k not in found or not item_done(found[k])):
+                found[k] = it
+        if status != "SUCCEEDED":
+            pool.recheck_current()   # it may have run out of credit mid-run
+    return found
+
+
+def _save_apify_items(items_by_key, site, output_dir):
+    """Keep the raw actor output for this run (replaces the old saved HTML pages)."""
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, f"apify_{site.lower()}_items.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(items_by_key, f, ensure_ascii=False, indent=2)
+        print(f"✅ raw {site} data saved to {path}")
+        return path
+    except Exception as e:
+        print(f"⚠️ could not save raw {site} data: {e}")
+        return None
+
+
+# -----------------------
 # AMAZON-specific logic
 # -----------------------
-async def save_amazon_htmls(
-    urls,
-    output_dir="outputs",
-    cookies_file="amazon_cookies.json",
-    headless=True,
-):
-    """Loop over the list of URLs, save each HTML to a unique file, and update cookies once."""
-    os.makedirs(output_dir, exist_ok=True)
+def _amazon_item_is_used(item):
+    """True when the buybox offer is a USED / renewed device (we only track NEW).
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless, slow_mo=100)
-
-        # Load existing cookies/session state if available
-        if os.path.exists(cookies_file):
-            print("🍪 Loading existing cookies/session...")
-            context = await browser.new_context(storage_state=cookies_file)
-        else:
-            print("🆕 No cookies found, creating a new session...")
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1366, "height": 768},
-            )
-
-        try:
-            results = []
-            for idx, url in enumerate(urls, start=1):
-                # empty slot (e.g. product not yet listed): keep the position so
-                # results stay aligned with the product groups, but skip cleanly.
-                if not url or not url.strip():
-                    print(f"\n[Amazon {idx}/{len(urls)}] empty URL slot -> skipping")
-                    results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
-                    continue
-                # Retry transient failures (nav error / timeout / price not
-                # rendered). A redirect or a genuine "Currently unavailable" page
-                # is a FINAL answer and is NOT retried.
-                safe_name = sanitize_filename(url)[:120]
-                output_file = os.path.join(output_dir, f"amazon_{idx}_{safe_name}.html")
-                result = None
-                for attempt in range(1, MAX_ATTEMPTS + 1):
-                    page = None
-                    try:
-                        page = await context.new_page()
-                        print(f"\n[Amazon {idx}/{len(urls)}] (attempt {attempt}/{MAX_ATTEMPTS}) Navigating to {url} ...")
-                        try:
-                            # 30s hard cap so a slow page can't stall the whole run.
-                            await page.goto(url, wait_until="load", timeout=30000)
-                        except TimeoutError:
-                            print(f"⚠️ navigation timeout for {url} after 30s. Continuing anyway...")
-                            try:
-                                await page.wait_for_load_state("domcontentloaded", timeout=7000)
-                            except TimeoutError:
-                                pass
-                        await asyncio.sleep(10)  # Extra wait to ensure dynamic content loads
-
-                        # Wait randomly for page content to settle
-                        await human_delay(3, 6)
-
-                        # 🖱️ Simulate random human-like mouse movement
-                        for _ in range(3):
-                            x = random.randint(200, 800)
-                            y = random.randint(200, 600)
-                            await page.mouse.move(x, y, steps=random.randint(5, 15))
-                            await human_delay(0.3, 1.5)
-
-                        # 🖱️ Random scrolling
-                        for _ in range(2):
-                            scroll_y = random.randint(400, 1000)
-                            await page.mouse.wheel(0, scroll_y)
-                            await human_delay(1, 3)
-
-                        # Extract HTML (resilient to any mid-load client-side navigation)
-                        html_content = await get_page_content_safe(page)
-                        with open(output_file, "w", encoding="utf-8") as f:
-                            f.write(html_content)
-                        print(f"✅ HTML saved to {output_file}")
-
-                        # parse (updated: redirect-aware, scoped price)
-                        price, redirected = parse_amazon_html(output_file, expected_url=url)
-
-                        if redirected:
-                            result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect"}
-                            break  # final: different product
-                        if price:
-                            # Amazon no longer exposes the SM- model on the page; the
-                            # writer fills SKU_Amazon from the known per-slot SM code.
-                            result = {"url": url, "file": output_file, "price": price, "model": None, "status": "ok"}
-                            break  # final: got a price
-                        # No price. If the page explicitly says unavailable, that's
-                        # a genuine result -> final. Otherwise the price element just
-                        # didn't render -> transient -> retry.
-                        result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"}
-                        if _looks_unavailable(html_content, "amazon"):
-                            print("ℹ️ page marked 'Currently unavailable' -> final, not retrying")
-                            break
-                        if _amazon_buybox_is_used(html_content):
-                            # Used-buybox: the new price is genuinely not offered.
-                            # Retrying won't change the condition -> final.
-                            print("ℹ️ buybox is a USED offer -> new price not available, not retrying")
-                            result["status"] = "used_offer"
-                            break
-                        print(f"⚠️ price not found & page not marked unavailable (attempt {attempt}/{MAX_ATTEMPTS})")
-                    except Exception as e:
-                        print(f"❌ Error processing URL {url} (attempt {attempt}/{MAX_ATTEMPTS}): {e}")
-                        result = {"url": url, "file": None, "price": None, "model": None, "status": f"error: {e}"}
-                    finally:
-                        if page:
-                            try:
-                                await page.close()
-                            except Exception:
-                                pass
-                    # reached only when the attempt was transient (no break)
-                    if attempt < MAX_ATTEMPTS:
-                        print(f"🔁 retrying in {AMAZON_RETRY_BACKOFF_SEC}s ...")
-                        await asyncio.sleep(AMAZON_RETRY_BACKOFF_SEC)
-
-                results.append(result)
-
-                # Politeness gap between consecutive Amazon URLs (this url is
-                # done; wait before starting the next one). Skipped after the
-                # final url, since nothing follows it. The empty-slot branch
-                # above `continue`s before reaching here, which is correct: it
-                # makes no network request, so it needs no gap.
-                if idx < len(urls):
-                    print(f"⏳ waiting {AMAZON_BETWEEN_URL_GAP_SEC}s before the next Amazon URL ...")
-                    await asyncio.sleep(AMAZON_BETWEEN_URL_GAP_SEC)
-
-            # Save cookies/session state after all pages are processed
-            storage_state = await context.storage_state()
-            with open(cookies_file, "w", encoding="utf-8") as f:
-                json.dump(storage_state, f, ensure_ascii=False, indent=4)
-            print(f"\n🍪 Cookies/session state written to {cookies_file}")
-
-        finally:
-            await browser.close()
-
-    return results
-
-def parse_amazon_html(html_file_path="amazon.html", expected_url=None):
-    """Return (price_text_or_None, redirected_bool).
-
-    - Redirect: compare requested ASIN vs the page's canonical link.
-    - Price: scoped to the MAIN price container (corePriceDisplay / priceToPay)
-      so we don't pick up sponsored/related prices elsewhere on the page.
+    The actor has no condition field; Amazon's used/warehouse seller is
+    "Amazon Resale", and renewed listings say so in the seller or title.
     """
-    if not os.path.exists(html_file_path):
-        print(f"Error: HTML file '{html_file_path}' not found.")
-        return None, False
+    seller = " ".join(str(item.get(k) or "") for k in ("seller_name", "ships_from"))
+    title = str(item.get("title") or "")
+    return bool(re.search(r"\b(resale|renewed|used)\b", seller, re.I)
+                or re.search(r"\brenewed\b", title, re.I))
 
-    with open(html_file_path, "r", encoding="utf-8", errors="ignore") as file:
-        html_content = file.read()
 
-    # -------- REDIRECT DETECTION --------
-    expected_asin = amazon_id_from_url(expected_url) if expected_url else None
-    canonical = get_canonical_href(html_content)
-    if expected_asin and canonical:
-        can_asin = amazon_id_from_url(canonical)
-        if can_asin and can_asin != expected_asin:
-            print(f"[REDIRECT] requested {expected_asin} but page is {can_asin} -> not available")
-            return None, True
+def _amazon_item_price(item):
+    """Buybox price as text, or None."""
+    pv = item.get("price_value")
+    if isinstance(pv, (int, float)) and pv > 0:
+        return f"{pv:.2f}"
+    num = clean_price_value(item.get("price"))
+    return f"{num:.2f}" if num and num > 0 else None
 
-    soup = BeautifulSoup(html_content, "lxml")
 
-    # -------- PRICE EXTRACTION (scoped to the main buybox price container) --------
-    price = None
-    core = (soup.find(id="corePriceDisplay_desktop_feature_div")
-            or soup.find(id="corePrice_feature_div")
-            or soup.find(id="apex_desktop"))
-    if core:
-        pt = (core.find(class_="priceToPay")
-              or core.find(class_="apexPriceToPay")
-              or core)
-        price_whole = pt.find("span", {"class": "a-price-whole"})
-        price_fraction = pt.find("span", {"class": "a-price-fraction"})
-        if price_whole:
-            whole = re.sub(r"[^\d,]", "", price_whole.get_text())
-            frac = re.sub(r"[^\d]", "", price_fraction.get_text()) if price_fraction else "00"
-            price = f"{whole}.{frac or '00'}"
+def _amazon_item_done(item):
+    """Whether this record is a final answer (else the URL is re-run)."""
+    return bool(_amazon_item_price(item)
+                or _looks_unavailable(str(item.get("availability") or ""), "amazon")
+                or _amazon_item_is_used(item))
+
+
+def fetch_amazon_via_apify(urls, pool, output_dir="outputs"):
+    """Amazon price per URL via the Apify actor. Returns results in URL order."""
+    keyed = {u: u for u in dict.fromkeys(u.strip() for u in urls if u and u.strip())}
+    asin_to_url = {amazon_id_from_url(u): u for u in keyed if amazon_id_from_url(u)}
+
+    def build_input(todo):
+        return {"Params": todo, "deliverTo": "US", "zipCode": "10001"}
+
+    def item_key(item):
+        # search_source echoes the URL we sent; fall back to the ASIN
+        src = str(item.get("search_source") or "").strip()
+        if src in keyed:
+            return src
+        return asin_to_url.get(str(item.get("asin") or "").upper())
+
+    found = {}
+    if keyed and pool.tokens:
+        found = _apify_collect(pool, "Amazon", APIFY_AMAZON_ACTOR, keyed,
+                               build_input, item_key, _amazon_item_done)
+        _save_apify_items(found, "Amazon", output_dir)
+
+    results = []
+    for idx, url in enumerate(urls, start=1):
+        if not url or not url.strip():
+            print(f"[Amazon {idx}/{len(urls)}] empty URL slot -> skipping")
+            results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
+            continue
+        item = found.get(url.strip())
+        if item is None:
+            print(f"[Amazon {idx}/{len(urls)}] ❌ no data from Apify -> left blank")
+            results.append({"url": url, "file": None, "price": None, "model": None, "status": "error: no data from Apify"})
+            continue
+
+        expected = amazon_id_from_url(url)
+        got = str(item.get("asin") or "").upper() or None
+        price = _amazon_item_price(item)
+        if expected and got and got != expected:
+            print(f"[Amazon {idx}/{len(urls)}] [REDIRECT] requested {expected} but got {got} -> not available")
+            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect"}
+        elif _amazon_item_is_used(item):
+            print(f"[Amazon {idx}/{len(urls)}] buybox is a USED offer (seller {item.get('seller_name')!r}) -> not available")
+            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "used_offer"}
+        elif price:
+            print(f"[Amazon {idx}/{len(urls)}] ✅ price {price} ({item.get('availability')})")
+            # SKU_Amazon is filled by the writer from the slot's Samsung SM code
+            result = {"price": price, "model": None, "status": "ok"}
         else:
-            for off in pt.find_all("span", {"class": "a-offscreen"}):
-                t = off.get_text(strip=True)
-                if t:
-                    price = t
-                    break
-
-    # -------- USED-OFFER GUARD --------
-    # If the featured buybox is a USED/renewed device, the price we just read is
-    # the USED price. We only track NEW-device prices, so discard it.
-    if price and _amazon_buybox_is_used(html_content):
-        print(f"⚠️ buybox is a USED offer (price {price}) -> discarding, new price not available")
-        price = None
-
-    if price:
-        print(f"The price of the product is: {price}")
-    else:
-        print("Price not found in the HTML file.")
-
-    return price, False
+            print(f"[Amazon {idx}/{len(urls)}] no price ({item.get('availability')!r}) -> not available")
+            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"}
+        results.append({"url": url, "file": None, **result})
+    return results
 
 
 # -----------------------
 # BESTBUY-specific logic
 # -----------------------
-def parse_bestbuy_html(input_file="bestbuy.html", expected_url=None):
+def _bestbuy_item_price(item):
+    """Current selling price as text, or None."""
+    num = clean_price_value(item.get("price"))
+    return f"{num:.2f}" if num and num > 0 else None
 
-    # Load HTML file
-    if not os.path.exists(input_file):
-        print(f"Error: HTML file '{input_file}' not found.")
-        return None, None, False
 
-    with open(input_file, "r", encoding="utf-8", errors="ignore") as f:
-        html = f.read()
+def _bestbuy_item_is_new(item):
+    cond = str(item.get("condition") or "new").strip().lower()
+    return cond == "new" and not item.get("openBoxCondition")
 
-    # -------- REDIRECT DETECTION --------
-    expected_code = bestbuy_id_from_url(expected_url) if expected_url else None
-    canonical = get_canonical_href(html)
-    if expected_code and canonical:
-        can_code = bestbuy_id_from_url(canonical)
-        if can_code and can_code != expected_code:
-            print(f"[REDIRECT] requested {expected_code} but page is {can_code} -> not available")
-            return None, None, True
 
-    # -------- PRICE + MODEL from JSON-LD (single, reliable source) --------
-    price = None
-    model_number = None
-    for it in iter_ldjson(html):
-        if not isinstance(it, dict):
+def _bestbuy_item_done(item):
+    return bool(_bestbuy_item_price(item)) or not _bestbuy_item_is_new(item)
+
+
+def fetch_bestbuy_via_apify(urls, pool, output_dir="outputs"):
+    """BestBuy price per URL via the Apify actor. Returns results in URL order.
+
+    URLs are matched by BestBuy's product code (e.g. JJGRF3TZF2), which the
+    actor keeps in the resolved URL it returns (".../JJGRF3TZF2/sku/6681685").
+    """
+    keyed = {}
+    for u in urls:
+        code = bestbuy_id_from_url(u) if u and u.strip() else None
+        if code:
+            keyed.setdefault(code, u.strip())
+
+    def build_input(todo):
+        return {"mode": "direct_urls", "productUrls": todo, "maxProducts": len(todo)}
+
+    def item_key(item):
+        return bestbuy_id_from_url(str(item.get("url") or ""))
+
+    found = {}
+    if keyed and pool.tokens:
+        found = _apify_collect(pool, "BestBuy", APIFY_BESTBUY_ACTOR, keyed,
+                               build_input, item_key, _bestbuy_item_done)
+        _save_apify_items(found, "BestBuy", output_dir)
+
+    results = []
+    for idx, url in enumerate(urls, start=1):
+        if not url or not url.strip():
+            print(f"[BestBuy {idx}/{len(urls)}] empty URL slot -> skipping")
+            results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
             continue
-        if price is None:
-            off = it.get("offers")
-            if isinstance(off, dict) and off.get("price"):
-                price = str(off["price"])
-            elif isinstance(off, list):
-                for o in off:
-                    if isinstance(o, dict) and o.get("price"):
-                        price = str(o["price"]); break
-        # Model Number is exposed as a PropertyValue in additionalProperty
-        for prop in it.get("additionalProperty", []) or []:
-            if isinstance(prop, dict) and str(prop.get("name", "")).lower() == "model number":
-                model_number = prop.get("value")
-    # regex fallback for model number if not in a parsed object
-    if not model_number:
-        m = re.search(r'"name"\s*:\s*"Model Number"\s*,\s*"value"\s*:\s*"([^"]+)"', html)
-        if m:
-            model_number = m.group(1)
+        item = found.get(bestbuy_id_from_url(url))
+        if item is None:
+            print(f"[BestBuy {idx}/{len(urls)}] ❌ no data from Apify -> left blank")
+            results.append({"url": url, "file": None, "price": None, "model": None, "status": "error: no data from Apify"})
+            continue
 
-    # -------- PRICE fallback: main visible price element (scoped) --------
-    if not price:
-        soup = BeautifulSoup(html, "lxml")
-        el = soup.select_one(
-            "div[data-testid='customer-price'] span, "
-            "span.font-sans.text-default.text-style-body-md-400.font-500.text-7.leading-7"
-        )
-        if el:
-            price = el.get_text(strip=True)
-
-    print("\n--- Extracted Product Data (BestBuy) ---")
-    print(f"File: {input_file}")
-    print(f"Price: {price}")
-    print(f"Model Number: {model_number}")
-    print("--------------------------------\n")
-
-    return price, model_number, False
-
-def _find_free_port():
-    """Return an OS-assigned free TCP port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _find_real_chrome():
-    """Locate the REAL Google Chrome binary (NOT Playwright's bundled Chromium).
-
-    BestBuy's bot protection is confirmed to pass with real Chrome; bundled
-    Chromium differs in fingerprint (UA-brand "Chromium", no Widevine/H.264,
-    different userAgentData) and may be flagged. So for BestBuy we insist on
-    real Chrome.
-
-    Resolution order:
-      1. $CHROME_BIN / $CHROME_PATH env var (set this on EC2 if Chrome is in a
-         non-standard location).
-      2. `chrome`/`google-chrome`/`google-chrome-stable` on PATH (Linux; the
-         GitHub Actions ubuntu runner ships google-chrome-stable).
-      3. Standard Windows install locations (for local Windows 11 runs).
-    Returns the path, or None if not found.
-    """
-    env = os.environ.get("CHROME_BIN") or os.environ.get("CHROME_PATH")
-    if env and os.path.exists(env):
-        return env
-
-    for name in ("google-chrome-stable", "google-chrome", "chrome",
-                 "chromium-browser", "chromium"):
-        found = shutil.which(name)
-        if found:
-            return found
-
-    for candidate in (
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/opt/google/chrome/chrome",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    ):
-        if candidate and os.path.exists(candidate):
-            return candidate
-
-    return None
-
-
-async def _launch_chrome_cdp(playwright, extra_args=None):
-    """Launch a REAL Chrome/Chromium process with a remote-debugging port and
-    connect Playwright to it over CDP.
-
-    Why CDP instead of playwright.chromium.launch() for BestBuy: launch() starts
-    Chromium with Playwright's automation switches (e.g. --enable-automation,
-    AutomationControlled), which BestBuy's bot protection fingerprints. By
-    starting Chrome ourselves with only the flags we choose and attaching over
-    the DevTools Protocol, the browser looks like an ordinary Chrome instance.
-
-    Each call launches a fresh process with a fresh throwaway --user-data-dir, so
-    every attempt gets a brand-new HTTP/2 connection AND a pristine, cookieless
-    profile (the two things that previously broke URL 2+).
-
-    Returns (browser, proc, profile_dir). Caller must close browser, kill proc,
-    and remove profile_dir.
-    """
-    port = _find_free_port()
-    profile_dir = tempfile.mkdtemp(prefix="bb_cdp_profile_")
-    # Use the REAL Google Chrome binary (confirmed to pass BestBuy). Do NOT fall
-    # back to bundled Chromium — its fingerprint differs and may be flagged.
-    chrome_path = _find_real_chrome()
-    if not chrome_path:
-        shutil.rmtree(profile_dir, ignore_errors=True)
-        raise RuntimeError(
-            "Real Google Chrome not found. Install it (Actions ubuntu runner "
-            "ships google-chrome-stable; on EC2 install google-chrome-stable) "
-            "or set the CHROME_BIN env var to its path.")
-
-    args = [
-        chrome_path,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile_dir}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "about:blank",
-    ]
-    if extra_args:
-        args.extend(extra_args)
-
-    # Headful: BestBuy won't serve a headless browser. On a display-less server
-    # (EC2 / GitHub Actions) this runs under Xvfb, which supplies $DISPLAY.
-    proc = subprocess.Popen(
-        args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # Wait for the CDP endpoint to come up, then read the WebSocket URL.
-    cdp_http = f"http://127.0.0.1:{port}"
-    ws_url = None
-    for _ in range(60):  # up to ~30s
-        try:
-            with urllib.request.urlopen(f"{cdp_http}/json/version", timeout=1) as r:
-                ws_url = json.loads(r.read().decode()).get("webSocketDebuggerUrl")
-            if ws_url:
-                break
-        except Exception:
-            await asyncio.sleep(0.5)
-    if not ws_url:
-        # cleanup before raising
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        shutil.rmtree(profile_dir, ignore_errors=True)
-        raise RuntimeError("Chrome CDP endpoint did not come up in time")
-
-    browser = await playwright.chromium.connect_over_cdp(ws_url)
-    return browser, proc, profile_dir
-
-
-async def save_bestbuy_htmls(
-    urls,
-    output_dir="outputs",
-    cookies_file="bestbuy_cookies.json",
-    headless=True,
-):
-    """
-    Loop over list of BestBuy URLs, save each page's HTML to output_dir,
-    parse with parse_bestbuy_html and return results list.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    async with async_playwright() as p:
-        # ROOT CAUSE of the "only the first URL works" failure: a single browser
-        # (and single context) was reused for every URL. Chromium keeps the HTTP/2
-        # connection to bestbuy.com ALIVE and reuses it across pages. BestBuy's bot
-        # protection flags that connection after the first request and then RESETS
-        # every subsequent stream on it -> net::ERR_HTTP2_PROTOCOL_ERROR on URL 2+.
-        # A new page on the same context reuses the same poisoned connection, so it
-        # never recovers.
-        #
-        # FIX: launch a COMPLETELY FRESH browser per attempt (guarantees a brand-new
-        # HTTP/2 connection every time), persisting cookies to disk between browsers
-        # so the session still carries over. This is the strongest form of the
-        # "fresh context per URL" trick the reference scraper uses.
-        #
-        # Browser is launched per-attempt via CDP (see _launch_chrome_cdp): we
-        # start a REAL Chrome process ourselves and attach over the DevTools
-        # Protocol, instead of p.chromium.launch() which stamps automation flags
-        # BestBuy fingerprints. Each attempt = fresh process + fresh throwaway
-        # profile = fresh HTTP/2 connection + pristine cookieless session.
-        #
-        # Other BestBuy specifics (unchanged):
-        #   - Headful: BestBuy won't serve a headless browser. On a display-less
-        #     server (EC2 / GitHub Actions) run under Xvfb.
-        #   - Default HTTP/2 (no --disable-http2, which returned empty shells).
-        #   - No custom user_agent (a spoofed UA on real Linux Chromium is a tell).
-        #   - Block image/media/font requests: fewer HTTP/2 streams to reset.
-
-        results = []
-        for idx, url in enumerate(urls, start=1):
-            # empty slot (e.g. product not yet listed): keep the position so
-            # results stay aligned with the product groups, but skip cleanly.
-            if not url or not url.strip():
-                print(f"\n[BestBuy {idx}/{len(urls)}] empty URL slot -> skipping")
-                results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
-                continue
-            # Retry transient failures (nav error / timeout / JSON-LD not
-            # rendered). A redirect or a genuine sold-out page is final.
-            safe_name = sanitize_filename(url)[:120]
-            output_file = os.path.join(output_dir, f"bestbuy_{idx}_{safe_name}.html")
-            result = None
-            for attempt in range(1, MAX_ATTEMPTS + 1):
-                browser = None
-                proc = None
-                profile_dir = None
-                context = None
-                page = None
-                try:
-                    # FRESH Chrome via CDP -> fresh HTTP/2 connection + a pristine,
-                    # throwaway profile for this URL/attempt. COOKIELESS by design:
-                    # BestBuy plants a bot-detection/session token in its response
-                    # cookies on the first visit; replaying it poisoned URL 2+
-                    # (net::ERR_HTTP2_PROTOCOL_ERROR). A brand-new --user-data-dir
-                    # each time guarantees no cookie/session carries over.
-                    browser, proc, profile_dir = await _launch_chrome_cdp(p)
-
-                    # Over CDP the fresh Chrome already exposes a default context
-                    # (browser.contexts[0]); since the profile is brand-new it is
-                    # pristine and cookieless, so we use it directly.
-                    context = (browser.contexts[0] if browser.contexts
-                               else await browser.new_context())
-
-                    page = await context.new_page()
-
-                    # Apply anti-bot stealth patches (BestBuy only). Masks the
-                    # automation fingerprints (navigator.webdriver, headless
-                    # hints, etc.) that BestBuy's protection checks. No-op if the
-                    # playwright-stealth package isn't installed. Must run before
-                    # navigation so the patches are in place when page scripts run.
-                    try:
-                        await _apply_stealth(page)
-                    except Exception as _se:
-                        print(f"⚠️ stealth patch failed (continuing without it): {_se}")
-
-                    # Abort image/media/font requests. Each is an HTTP/2 stream on
-                    # the connection; blocking them leaves only the document +
-                    # JSON/JS we actually parse (lighter, faster, fewer resets).
-                    async def _block_heavy(route, request):
-                        if request.resource_type in ("image", "media", "font"):
-                            await route.abort()
-                        else:
-                            await route.continue_()
-                    await page.route("**/*", _block_heavy)
-
-                    print(f"\n[BestBuy {idx}/{len(urls)}] (attempt {attempt}/{MAX_ATTEMPTS}) Navigating to {url} ...")
-
-                    try:
-                        # wait_until="domcontentloaded" (NOT "load"): returning at
-                        # DOMContentLoaded avoids waiting on the flaky subresource
-                        # streams; the JS-injected price populates during the wait
-                        # below. Generous 180s cap matches the reference.
-                        await page.goto(url, wait_until="domcontentloaded", timeout=180000)
-                        await asyncio.sleep(10)  # extra wait to ensure stability
-                    except TimeoutError:
-                        print(f"⚠️ navigation timeout for {url} after 180s. Continuing anyway...")
-
-                    # Wait randomly for page content to settle
-                    await human_delay(3, 6)
-
-                    # 🖱️ Simulate random human-like mouse movement
-                    for _ in range(3):
-                        x = random.randint(200, 800)
-                        y = random.randint(200, 600)
-                        await page.mouse.move(x, y, steps=random.randint(5, 15))
-                        await human_delay(0.3, 1.5)
-
-                    # 🖱️ Random scrolling
-                    for _ in range(2):
-                        scroll_y = random.randint(400, 1000)
-                        await page.mouse.wheel(0, scroll_y)
-                        await human_delay(1, 3)
-
-                    # The price/model come from a JSON-LD block that BestBuy
-                    # injects via client-side JS. Wait for that JSON-LD (with an
-                    # "offers" field) before capturing, so we don't save a
-                    # half-loaded page that parses to Price=None / Model=None.
-                    try:
-                        await page.wait_for_function(
-                            """() => {
-                                const s = document.querySelectorAll('script[type="application/ld+json"]');
-                                for (const el of s) {
-                                    if (el.textContent && el.textContent.indexOf('"offers"') !== -1) return true;
-                                }
-                                return false;
-                            }""",
-                            timeout=20000,
-                        )
-                    except Exception:
-                        print("⚠️ BestBuy JSON-LD offers not detected within 20s; saving page anyway")
-
-                    # Extract HTML (resilient to BestBuy's mid-load client-side
-                    # navigation which used to make page.content() throw)
-                    html_content = await get_page_content_safe(page)
-                    with open(output_file, "w", encoding="utf-8") as f:
-                        f.write(html_content)
-                    print(f"✅ HTML saved to {output_file}")
-
-                    # NOTE: intentionally do NOT save cookies for BestBuy. Persisting
-                    # BestBuy's session token and replaying it is what poisoned URL 2+
-                    # (see the cookieless context comment above). Every page stays
-                    # pristine, matching the known-good reference scraper.
-
-                    # Parse (updated: redirect-aware, JSON-LD)
-                    price, model, redirected = parse_bestbuy_html(output_file, expected_url=url)
-
-                    if redirected:
-                        result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect"}
-                        break  # final: different product
-                    if price:
-                        result = {"url": url, "file": output_file, "price": price, "model": model, "status": "ok"}
-                        break  # final: got a price
-                    result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"}
-                    if _looks_unavailable(html_content, "bestbuy"):
-                        print("ℹ️ page marked sold out / no longer available -> final, not retrying")
-                        break
-                    print(f"⚠️ price not found & page not marked unavailable (attempt {attempt}/{MAX_ATTEMPTS})")
-                except Exception as e:
-                    print(f"❌ Error processing URL {url} (attempt {attempt}/{MAX_ATTEMPTS}): {e}")
-                    result = {"url": url, "file": None, "price": None, "model": None, "status": f"error: {e}"}
-                finally:
-                    # Tear down EVERYTHING so the next attempt/URL starts on a
-                    # brand-new Chrome process + connection + profile.
-                    for closable in (page, context, browser):
-                        if closable:
-                            try:
-                                await closable.close()
-                            except Exception:
-                                pass
-                    # browser.close() only DISCONNECTS the CDP session; the real
-                    # Chrome process we spawned must be killed explicitly, and its
-                    # throwaway profile dir removed, or they'd leak every attempt.
-                    if proc:
-                        try:
-                            proc.kill()
-                            proc.wait(timeout=10)
-                        except Exception:
-                            pass
-                    if profile_dir:
-                        shutil.rmtree(profile_dir, ignore_errors=True)
-                if attempt < MAX_ATTEMPTS:
-                    print(f"🔁 retrying in {RETRY_BACKOFF_SEC}s ...")
-                    await asyncio.sleep(RETRY_BACKOFF_SEC)
-
-            results.append(result)
-
+        price = _bestbuy_item_price(item)
+        model = item.get("modelNumber")
+        if not _bestbuy_item_is_new(item):
+            print(f"[BestBuy {idx}/{len(urls)}] offer is not new ({item.get('condition')}/{item.get('openBoxCondition')}) -> not available")
+            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "not_new"}
+        elif price:
+            print(f"[BestBuy {idx}/{len(urls)}] ✅ price {price} (model {model})")
+            result = {"price": price, "model": model, "status": "ok"}
+        else:
+            print(f"[BestBuy {idx}/{len(urls)}] no price -> not available")
+            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"}
+        results.append({"url": url, "file": None, **result})
     return results
 
 # -----------------------
@@ -1661,14 +1447,18 @@ async def main():
 
     ]
 
-    print("\n=== Running Amazon scraper ===")
-    am_res = await save_amazon_htmls(amazon_urls, output_dir="outputs", cookies_file="amazon_cookies.json", headless=True)
+    # Amazon + BestBuy via Apify (one shared token pool, so a token that runs
+    # out during Amazon is not tried again for BestBuy)
+    apify_pool = ApifyTokenPool.from_env()
+
+    print("\n=== Running Amazon (Apify) ===")
+    am_res = fetch_amazon_via_apify(amazon_urls, apify_pool, output_dir="outputs")
     print("\nAmazon Summary:")
     for r in am_res:
         print(r)
 
-    print("\n=== Running BestBuy scraper ===")
-    bb_res = await save_bestbuy_htmls(bestbuy_urls, output_dir="outputs", cookies_file="bestbuy_cookies.json", headless=True)
+    print("\n=== Running BestBuy (Apify) ===")
+    bb_res = fetch_bestbuy_via_apify(bestbuy_urls, apify_pool, output_dir="outputs")
     print("\nBestBuy Summary:")
     for r in bb_res:
         print(r)
