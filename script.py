@@ -48,6 +48,22 @@ from openpyxl import Workbook, load_workbook
 # =========================================================================
 NOT_AVAILABLE = "not available"
 
+# ---- plain-English reasons, written in the price cell when there is no price ----
+# Every result dict carries one of these in "reason" (unless a price was found).
+# Product facts (what the SITE says) and our own failures are kept separate, so
+# e.g. a page that never loaded is never reported as "Out of stock".
+R_NOT_SOLD_HERE   = "Not sold here"        # no URL for this product on this site
+R_OUT_OF_STOCK    = "Out of stock"         # the site says out of stock / unavailable
+R_LISTING_REMOVED = "Listing removed"      # the URL now opens a different product
+R_NOT_SOLD_NEW    = "Not sold new"         # only used / renewed / open-box offers
+R_NO_PRICE_SHOWN  = "No price shown"       # product page loaded, site shows no price
+R_PAGE_NOT_LOADED = "Page didn't load"     # page came back without its product data
+R_BLOCKED         = "Blocked by site"      # bot-check page on every attempt
+R_NETWORK         = "Network issue"        # browser crash / timeout / connection error
+R_FETCH_FAILED    = "Couldn't fetch"       # Apify ran but returned nothing usable
+R_NOT_CHECKED     = "Not checked"          # no Apify token configured
+R_SERVICE_DOWN    = "Service unavailable"  # Apify tokens out of credit / rejected
+
 # Samsung retry policy for transient failures (network errors, timeouts, or a
 # page that navigated OK but didn't render its price in time). 1 initial try +
 # 2 retries. Genuine outcomes (a redirect to another product, or a page that
@@ -296,16 +312,21 @@ def _to_jsonable(v):
 def _render_cells(result, slot_sku, site):
     """Given a per-URL result dict, return (price_cell, sku_cell) for the sheet.
 
-    - price -> float when parseable, "not available" for redirect/no-price, else None.
+    - price -> float when parseable, else the result's plain-English "reason"
+               (e.g. "Out of stock", "Network issue"; see the R_* constants).
     - sku   -> canonical per-slot SM code (Amazon/BestBuy upper, Samsung lower);
-               "not available" mirrors the price when the product wasn't found.
+               the reason mirrors the price when no price was found.
     """
     raw = result.get("price") if result else None
-    if raw == NOT_AVAILABLE:
-        return NOT_AVAILABLE, NOT_AVAILABLE
-    num = clean_price_value(raw)
+    num = clean_price_value(raw) if raw != NOT_AVAILABLE else None
     if num is None:
-        return None, None            # genuine gap (fetch error / empty URL) -> blank
+        reason = result.get("reason") if result else None
+        if reason:
+            return reason, reason
+        # fallback for a result without a reason (should not happen)
+        if raw == NOT_AVAILABLE:
+            return NOT_AVAILABLE, NOT_AVAILABLE
+        return None, None
     sku = None
     if slot_sku:
         sku = slot_sku if site == "samsung" else slot_sku.upper()
@@ -819,6 +840,15 @@ def _save_apify_items(items_by_key, site, output_dir):
         return None
 
 
+def _apify_missing_reason(pool):
+    """Reason for a URL the actor returned no usable data for."""
+    if not pool.tokens:
+        return R_NOT_CHECKED          # APIFY_API_TOKENS not set
+    if pool.idx >= len(pool.tokens):
+        return R_SERVICE_DOWN         # every token out of credit / rejected
+    return R_FETCH_FAILED
+
+
 # -----------------------
 # AMAZON-specific logic
 # -----------------------
@@ -875,12 +905,15 @@ def fetch_amazon_via_apify(urls, pool, output_dir="outputs"):
     for idx, url in enumerate(urls, start=1):
         if not url or not url.strip():
             print(f"[Amazon {idx}/{len(urls)}] empty URL slot -> skipping")
-            results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
+            results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty",
+                            "reason": R_NOT_SOLD_HERE})
             continue
         item = found.get(url.strip())
         if item is None:
-            print(f"[Amazon {idx}/{len(urls)}] ❌ no data from Apify -> left blank")
-            results.append({"url": url, "file": None, "price": None, "model": None, "status": "error: no data from Apify"})
+            reason = _apify_missing_reason(pool)
+            print(f"[Amazon {idx}/{len(urls)}] ❌ no data from Apify -> {reason}")
+            results.append({"url": url, "file": None, "price": None, "model": None, "status": "error: no data from Apify",
+                            "reason": reason})
             continue
 
         expected = amazon_id_from_url(url)
@@ -888,17 +921,24 @@ def fetch_amazon_via_apify(urls, pool, output_dir="outputs"):
         price = _amazon_item_price(item)
         if expected and got and got != expected:
             print(f"[Amazon {idx}/{len(urls)}] [REDIRECT] requested {expected} but got {got} -> not available")
-            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect"}
+            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "redirect", "reason": R_LISTING_REMOVED}
         elif _amazon_item_is_used(item):
             print(f"[Amazon {idx}/{len(urls)}] buybox is a USED offer (seller {item.get('seller_name')!r}) -> not available")
-            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "used_offer"}
+            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "used_offer", "reason": R_NOT_SOLD_NEW}
         elif price:
             print(f"[Amazon {idx}/{len(urls)}] ✅ price {price} ({item.get('availability')})")
             # SKU_Amazon is filled by the writer from the slot's Samsung SM code
             result = {"price": price, "model": None, "status": "ok"}
         else:
-            print(f"[Amazon {idx}/{len(urls)}] no price ({item.get('availability')!r}) -> not available")
-            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"}
+            if not item.get("title"):
+                # an empty record: the actor never read the product page
+                reason = R_FETCH_FAILED
+            elif _looks_unavailable(str(item.get("availability") or ""), "amazon"):
+                reason = R_OUT_OF_STOCK         # "Currently unavailable."
+            else:
+                reason = R_NO_PRICE_SHOWN       # page read, but no buy-box price
+            print(f"[Amazon {idx}/{len(urls)}] no price ({item.get('availability')!r}) -> {reason}")
+            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price", "reason": reason}
         results.append({"url": url, "file": None, **result})
     return results
 
@@ -949,25 +989,28 @@ def fetch_bestbuy_via_apify(urls, pool, output_dir="outputs"):
     for idx, url in enumerate(urls, start=1):
         if not url or not url.strip():
             print(f"[BestBuy {idx}/{len(urls)}] empty URL slot -> skipping")
-            results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty"})
+            results.append({"url": url, "file": None, "price": None, "model": None, "status": "empty",
+                            "reason": R_NOT_SOLD_HERE})
             continue
         item = found.get(bestbuy_id_from_url(url))
         if item is None:
-            print(f"[BestBuy {idx}/{len(urls)}] ❌ no data from Apify -> left blank")
-            results.append({"url": url, "file": None, "price": None, "model": None, "status": "error: no data from Apify"})
+            reason = _apify_missing_reason(pool)
+            print(f"[BestBuy {idx}/{len(urls)}] ❌ no data from Apify -> {reason}")
+            results.append({"url": url, "file": None, "price": None, "model": None, "status": "error: no data from Apify",
+                            "reason": reason})
             continue
 
         price = _bestbuy_item_price(item)
         model = item.get("modelNumber")
         if not _bestbuy_item_is_new(item):
             print(f"[BestBuy {idx}/{len(urls)}] offer is not new ({item.get('condition')}/{item.get('openBoxCondition')}) -> not available")
-            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "not_new"}
+            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "not_new", "reason": R_NOT_SOLD_NEW}
         elif price:
             print(f"[BestBuy {idx}/{len(urls)}] ✅ price {price} (model {model})")
             result = {"price": price, "model": model, "status": "ok"}
         else:
-            print(f"[BestBuy {idx}/{len(urls)}] no price -> not available")
-            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price"}
+            print(f"[BestBuy {idx}/{len(urls)}] no price -> {R_NO_PRICE_SHOWN}")
+            result = {"price": NOT_AVAILABLE, "model": NOT_AVAILABLE, "status": "no_price", "reason": R_NO_PRICE_SHOWN}
         results.append({"url": url, "file": None, **result})
     return results
 
@@ -1040,6 +1083,23 @@ def extract_price(filename, expected_url=None):
     print("🔎 Extracted Price:", price)
     return price, False
 
+def _samsung_no_price_reason(html, expected_url):
+    """Plain-English reason when no price was read from a Samsung page.
+    Decided from the JSON-LD entry for THIS sku only. (Not from
+    _looks_unavailable(html, "samsung"): that searches the whole page for
+    "out of stock" / "notify me" / "sold out", words that every Samsung page
+    contains in its built-in message templates, so it is always True.)"""
+    sku = (extract_sku_from_url(expected_url) or "").lower()
+    for it in iter_ldjson(html or ""):
+        if isinstance(it, dict) and it.get("sku") and str(it["sku"]).lower() == sku:
+            off = it.get("offers")
+            avail = str(off.get("availability", "")).lower() if isinstance(off, dict) else ""
+            if any(k in avail for k in ("outofstock", "soldout", "discontinued")):
+                return R_OUT_OF_STOCK
+            return R_NO_PRICE_SHOWN       # product data loaded, no price in it
+    return R_PAGE_NOT_LOADED              # no product data for this sku on the page
+
+
 async def save_samsung_htmls(
     urls,
     output_dir="outputs",
@@ -1068,7 +1128,8 @@ async def save_samsung_htmls(
                 # results stay aligned with the product groups, but skip cleanly.
                 if not url or not url.strip():
                     print(f"\n[Samsung {idx}/{len(urls)}] empty URL slot -> skipping")
-                    results.append({"url": url, "file": None, "price": None, "sku": None, "status": "empty"})
+                    results.append({"url": url, "file": None, "price": None, "sku": None, "status": "empty",
+                                    "reason": R_NOT_SOLD_HERE})
                     continue
                 safe_name = sanitize_filename(url)
                 output_file = os.path.join(output_dir, f"samsung_{idx}_{safe_name}.html")
@@ -1121,21 +1182,24 @@ async def save_samsung_htmls(
 
                         if not device_info_ok:
                             # transient (page structure never appeared) -> retry
-                            result = {"url": url, "file": output_file, "price": None, "sku": sku, "status": "partial: no device_info"}
+                            result = {"url": url, "file": output_file, "price": None, "sku": sku, "status": "partial: no device_info",
+                                      "reason": R_PAGE_NOT_LOADED}
                             print(f"⚠️ #device_info missing (attempt {attempt}/{MAX_ATTEMPTS})")
                         else:
                             # Parse saved HTML (updated: redirect-aware, JSON-LD by SKU)
                             price, redirected = extract_price(output_file, expected_url=url)
                             if redirected:
                                 print("[REDIRECT] Samsung redirect -> not available")
-                                result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "sku": NOT_AVAILABLE, "status": "redirect"}
+                                result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "sku": NOT_AVAILABLE, "status": "redirect",
+                                          "reason": R_LISTING_REMOVED}
                                 break  # final: different product
                             elif price:
                                 print("🔎 Final extracted values — Price:", price, "SKU:", sku)
                                 result = {"url": url, "file": output_file, "price": price, "sku": sku, "status": "ok"}
                                 break  # final: got a price
                             else:
-                                result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "sku": NOT_AVAILABLE, "status": "no_price"}
+                                result = {"url": url, "file": output_file, "price": NOT_AVAILABLE, "sku": NOT_AVAILABLE, "status": "no_price",
+                                          "reason": _samsung_no_price_reason(html, url)}
                                 if _looks_unavailable(html, "samsung"):
                                     print("ℹ️ page marked sold out / coming soon -> final, not retrying")
                                     break
@@ -1145,7 +1209,8 @@ async def save_samsung_htmls(
                         await human_delay_short()
                     except Exception as e:
                         print(f"❌ Error processing URL {url} (attempt {attempt}/{MAX_ATTEMPTS}): {e}")
-                        result = {"url": url, "file": None, "price": None, "sku": None, "status": f"error: {e}"}
+                        result = {"url": url, "file": None, "price": None, "sku": None, "status": f"error: {e}",
+                                  "reason": R_NETWORK}
                     finally:
                         try:
                             if page:
