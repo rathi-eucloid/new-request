@@ -48,7 +48,7 @@ jobs:
           python -m pip install --upgrade pip
           # Amazon + BestBuy now come from Apify (plain HTTPS, no extra package);
           # only Samsung still uses Playwright.
-          pip install playwright openpyxl
+          pip install playwright openpyxl tzdata
 
       - name: Install Playwright Chromium (with deps)
         run: |
